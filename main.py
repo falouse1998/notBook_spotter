@@ -133,9 +133,9 @@ TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMess
 
 PRICE_RE = re.compile(r"^(?:[€£]|(?:EUR|GBP)\xa0)[\d.,]+$")
 
-# The Notebooks category node turned out to be far leakier than DDR5's memory
-# one ever was — mechanical keyboards, monitors, a robot vacuum and a software
-# licence all showed up warehouse-priced under it. A title has to actually say
+# The Notebooks category node is far leakier than a keyword search would be —
+# mechanical keyboards, monitors, a robot vacuum and a software licence have
+# all shown up warehouse-priced under it. A title has to actually say
 # it is a laptop before it can raise an alert; category membership alone is
 # not enough to trust.
 NOTEBOOK_WORDS = (
