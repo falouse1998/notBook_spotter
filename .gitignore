@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime state and logs — the VPS's copy is the source of truth, never the repo
+known_listings*.json
+watcher.lock
+*.log
+out.txt
+err.txt
+test_output.txt
+test_error.txt
+
+# Secrets — real credentials never get committed
+telegram.env
+.env
+
+# IDE / editor
+.idea/
+.claude/
+
+# Accidental "... copy" duplicate files from local backups
+* copy*

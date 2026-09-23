@@ -1,0 +1,14 @@
+[Unit]
+Description=Notebook Spotter watchdog - Telegram alert on outage, wedge or crash
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/notebook_spotter/telegram.env
+ExecStart=/usr/bin/python3 /opt/notebook_spotter/watchdog.py
+# Never let a watchdog failure look like a service failure.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=notebook_spotter_watchdog

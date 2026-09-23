@@ -1,0 +1,56 @@
+[Unit]
+Description=Notebook Spotter - Amazon Warehouse laptop sniper
+After=network-online.target
+Wants=network-online.target
+
+# Never give up: no matter how often it crashes, systemd keeps restarting it.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+
+# The container is disposable; everything worth keeping is in /opt/notebook_spotter/state.
+# A leftover container from an unclean shutdown would block the name, so clear it.
+ExecStartPre=-/usr/bin/podman rm -f notebook_spotter
+
+# --shm-size: five Chromes on the default 64MB /dev/shm crash under load.
+# --memory / --cpus: sized for a 4-core / 8GB host. The app sits around 1 core
+# and 3-4GB, so these are headroom, not a budget: memory leaves the OS ~3GB, and
+# leaving one core free is what keeps the box reachable over SSH if Chrome storms.
+# --log-driver=none: the container's output is already attached to this unit's
+# stdout and lands in the journal that way. Podman's own journald driver would
+# write every line a second time.
+# slirp4netns keeps networking entirely in userspace: no podman0 bridge, no
+# iptables NAT rules, nothing added to the host's network config. The container
+# only ever dials out (Amazon, Telegram), so it never needs an inbound path.
+# Telegram credentials come in via env, not the image, so the built image and the
+# git repo it comes from never carry the real token.
+ExecStart=/usr/bin/podman run --rm --name notebook_spotter \
+    --log-driver=none \
+    --network=slirp4netns \
+    --shm-size=1g \
+    --memory=5g \
+    --cpus=3 \
+    --env-file /opt/notebook_spotter/telegram.env \
+    --volume /opt/notebook_spotter/state:/state \
+    localhost/notebook_spotter:latest
+
+ExecStop=/usr/bin/podman stop -t 30 notebook_spotter
+
+# Never stops: any exit, crash, or OOM comes back after 15s, forever.
+# podman relays the container's SIGTERM exit code, so a deliberate `systemctl
+# stop` would otherwise leave the unit reading "failed" instead of "inactive".
+# Restart=always still restarts on every exit, success or not.
+SuccessExitStatus=0 130 143
+
+Restart=always
+RestartSec=15
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=notebook_spotter
+
+[Install]
+WantedBy=multi-user.target

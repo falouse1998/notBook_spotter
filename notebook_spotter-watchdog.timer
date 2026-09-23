@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Notebook Spotter watchdog every minute
+
+[Timer]
+# First check shortly after boot, then every minute. Persistent=false because a
+# missed check while the box was off tells us nothing we want to alert on.
+OnBootSec=90
+OnUnitActiveSec=60
+AccuracySec=10
+Unit=notebook_spotter-watchdog.service
+
+[Install]
+WantedBy=timers.target

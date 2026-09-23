@@ -1,0 +1,11 @@
+.git
+.idea
+.claude
+__pycache__
+*.pyc
+out.txt
+err.txt
+test_output.txt
+test_error.txt
+watcher.lock
+known_listings.json
