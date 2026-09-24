@@ -115,6 +115,11 @@ LONG_COOLDOWN     = 120
 # notebook found, and let the price in the message do the talking.
 MAX_PRICE: Optional[float] = None
 
+# A price drop only alerts once it clears this fraction — a €0.01 wobble on a
+# €600 laptop is not worth a notification. Relists (a delisted item coming
+# back cheaper) use the same bar. Rises never alert, at any size.
+PRICE_DROP_THRESHOLD = 0.05
+
 # Adds the "N% off | was X" line by loading each product page. Costs 5-12s per
 # alert, paid at the worst possible moment, so it is off by default.
 LIST_PRICE_LOOKUP = False
@@ -295,6 +300,17 @@ def good_enough(price_str: str) -> bool:
     if MAX_PRICE is None:
         return True
     return parse_price(price_str) <= MAX_PRICE
+
+
+def price_dropped_enough(old_price: str, new_price: str) -> bool:
+    """True only for a real drop of at least PRICE_DROP_THRESHOLD — a rise,
+    an unparseable price, or a wobble too small to matter all return False."""
+    old_v, new_v = parse_price(old_price), parse_price(new_price)
+    if old_v in (0.0, float("inf")) or new_v == float("inf"):
+        return False
+    if new_v >= old_v:
+        return False
+    return (old_v - new_v) / old_v >= PRICE_DROP_THRESHOLD
 
 
 # ── TYPES ─────────────────────────────────────────────────────────────────────
@@ -842,9 +858,10 @@ def run_cycle(known: KnownMap,
                 old = market.get("price")
 
                 if not entry.get("active", True):
-                    # A relist is only news if it came back cheaper. Coming back
-                    # at the same price is just the listing flickering.
-                    if old and parse_price(price) < parse_price(old):
+                    # A relist is only news if it came back meaningfully
+                    # cheaper. Coming back at the same price (or a token
+                    # discount) is just the listing flickering.
+                    if old and price_dropped_enough(old, price):
                         btag, btitle, bprice, url = best_deal(asin, combined[asin])
                         blow = entry.get("markets", {}).get(btag, {}).get("lowest")
                         log(f"  *** RELIST [{btag}] ***  {old} → {bprice}  |  {btitle[:52]}")
@@ -853,8 +870,9 @@ def run_cycle(known: KnownMap,
                         alerted.add(asin)
                     continue
 
-                # Only drops. A rise is not something you act on.
-                if old and parse_price(price) < parse_price(old):
+                # Only drops of at least PRICE_DROP_THRESHOLD. A rise, or a
+                # drop too small to matter, is not something you act on.
+                if old and price_dropped_enough(old, price):
                     log(f"  *** DROP [{tag}] ***  {old} → {price}  |  {title[:55]}")
                     send_price_change(asin, tag, title, old, price,
                                       f"{DOMAINS[tag]}/dp/{asin}",
