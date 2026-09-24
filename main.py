@@ -70,6 +70,14 @@ DOMAINS = {
     "UK": "https://www.amazon.co.uk",
 }
 
+# What a card on this marketplace should be priced in. Amazon occasionally
+# shows a card priced in a different currency (a third-party offer, seemingly),
+# and taking that at face value once poisoned a market's stored price — a
+# later genuine drop compared a real £ price against a stale € one and
+# produced a nonsense "-14%". A price in the wrong currency for its own
+# marketplace is treated the same as no price at all.
+EXPECTED_CURRENCY = {"DE": "€", "IT": "€", "ES": "€", "FR": "€", "UK": "£"}
+
 # A deliverable address per marketplace. This is what unlocks the prices.
 ZIPS = {
     "DE": "10115",      # Berlin
@@ -304,7 +312,14 @@ def good_enough(price_str: str) -> bool:
 
 def price_dropped_enough(old_price: str, new_price: str) -> bool:
     """True only for a real drop of at least PRICE_DROP_THRESHOLD — a rise,
-    an unparseable price, or a wobble too small to matter all return False."""
+    an unparseable price, or a wobble too small to matter all return False.
+
+    Also guards against comparing a price stuck in the wrong currency from
+    before EXPECTED_CURRENCY filtering existed — €984.39 to £846.14 is not
+    a 14% drop, it is two different currencies, and treating it as a real
+    move is how that exact nonsense alert happened."""
+    if currency_of(old_price) != currency_of(new_price):
+        return False
     old_v, new_v = parse_price(old_price), parse_price(new_price)
     if old_v in (0.0, float("inf")) or new_v == float("inf"):
         return False
@@ -543,15 +558,17 @@ def card_price(card) -> Optional[str]:
     return None
 
 
-def parse_results(html: str) -> Tuple[DomainMap, int, int]:
+def parse_results(html: str, tag: str) -> Tuple[DomainMap, int, int]:
     """Returns (notebook results, cards on page, cards carrying any price)."""
     soup = BeautifulSoup(html, "html.parser")
     results: DomainMap = {}
     cards = priced = 0
+    expected = EXPECTED_CURRENCY[tag]
 
     for card in soup.select("[data-component-type='s-search-result']"):
         cards += 1
-        if card_price(card):
+        raw_price = card_price(card)
+        if raw_price:
             priced += 1
         asin = card.get("data-asin", "")
         if not asin:
@@ -568,9 +585,8 @@ def parse_results(html: str) -> Tuple[DomainMap, int, int]:
         if not is_notebook(title):
             continue
 
-        price = card_price(card)
-        if price:
-            results[asin] = (title, price)
+        if raw_price and currency_of(raw_price) == expected:
+            results[asin] = (title, raw_price)
 
     return results, cards, priced
 
@@ -611,7 +627,7 @@ def fetch_domain(tag: str) -> DomainMap:
     except Exception:
         pass
 
-    results, cards, priced = parse_results(driver.page_source)
+    results, cards, priced = parse_results(driver.page_source, tag)
 
     # Results but not one price on the whole page means the delivery address
     # was lost, not that stock ran out. Treating that as "no stock" is what
@@ -670,6 +686,8 @@ def _links(asin: str, tag: str, url: str) -> str:
 def lowest_line(price: str, lowest: Optional[str]) -> Optional[str]:
     """The line that turns 'this exists' into 'this is worth buying'."""
     if not lowest:
+        return None
+    if currency_of(lowest) != currency_of(price):
         return None
     low_v, now_v = parse_price(lowest), parse_price(price)
     if low_v in (0.0, float("inf")) or now_v == float("inf"):
@@ -897,7 +915,13 @@ def run_cycle(known: KnownMap,
                 continue
             market["price"]     = price
             market["last_seen"] = when
-            if parse_price(price) < parse_price(market.get("lowest") or price):
+            stored_lowest = market.get("lowest")
+            # A "lowest" left over from before EXPECTED_CURRENCY filtering
+            # existed can be stuck in the wrong currency; self-heal it onto
+            # the current (now currency-verified) price rather than compare
+            # numbers across currencies forever.
+            if (not stored_lowest or currency_of(stored_lowest) != currency_of(price)
+                    or parse_price(price) < parse_price(stored_lowest)):
                 market["lowest"]    = price
                 market["lowest_at"] = when
 
