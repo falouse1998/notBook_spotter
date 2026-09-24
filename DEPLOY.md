@@ -157,29 +157,36 @@ anything priced above that page is never seen at all, however fast the polling.
 
 ## Search URLs
 
-Each marketplace has its own Warehouse node and its own Notebooks category, and all three
-parameters have to agree or Amazon silently ignores the category filter and serves the
-wrong department:
+Each marketplace has its own Warehouse node, its own Notebooks category, and a
+`p_n_g-...` RAM-capacity facet that makes Amazon itself pre-filter to ~16GB+ before a
+card ever reaches `main.py`. All of that has to agree or Amazon silently ignores the
+filters and serves the wrong department:
 
-| | srs / bbn (Warehouse) | rh=n: (Notebooks) |
-|---|---|---|
-| DE | 3581963031 | 427957031 |
-| IT | 3581999031 | 460158031 |
-| ES | 3582001031 | 938008031 |
-| FR | 3581943031 | 429879031 |
-| UK | 3581866031 | 429886031 |
+| | srs / bbn (Warehouse) | rh=n: (Notebooks) | RAM facet (p_n_g-1003119721111) |
+|---|---|---|---|
+| DE | 3581963031 | 427957031 | 100549564031\|27399048031\|27399051031\|27399052031 |
+| IT | 3581999031 | 460158031 | 27399062031\|27399065031\|27399066031 |
+| ES | 3582001031 | 938008031 | 100549558031\|27399055031\|27399058031\|27399059031 |
+| FR | 3581943031 | 429879031 | 27399077031\|27399080031\|27399081031 |
+| UK | 3581866031 | 429886031 | 27399086031\|27399089031\|27399090031 |
 
-Unlike the memory-only search this project started as, the Notebooks category has no
-`k=` keyword to narrow it further — it's a browse of the whole department. That makes it
-leakier: mechanical keyboards, monitors, a robot vacuum, a software licence and a stylus
-have all shown up warehouse-priced under it. `is_notebook()` in `main.py` compensates with
-a two-sided check — a title must contain an actual laptop/notebook word (multi-language)
-*and* not match a broad accessory/spare-parts exclusion list — rather than trusting the
-category alone.
+DE additionally stacks a storage-capacity facet (`p_n_g-101014849667111:88253294031`) and
+uses `i=computers` instead of `i=warehouse-deals` like the other four — that's simply what
+Amazon's own UI produced for this exact node/facet combination on that marketplace; `srs`/
+`bbn` still constrain it to the Warehouse node the same way, verified live.
 
-To find these for a new marketplace: open the unfiltered Warehouse Notebooks search and
-read the href of its own "Notebooks" department refinement, which carries the correct
-`bbn` and node.
+Even with the RAM facet doing most of the work, the Notebooks category has no `k=` keyword
+to narrow it further, and handheld gaming PCs (Legion Go, ROG Ally) carry real RAM/storage
+specs and warehouse pricing just like a laptop does, so they clear the facet too.
+`is_notebook()` in `main.py` layers three independent checks rather than trusting the
+category+facet combo alone: a title must contain an actual laptop word or product-line
+name (multi-language), must not match a broad accessory/spare-parts exclusion list or the
+handheld-gaming list, and must parse to real RAM ≥ 16GB and storage ≥ 512GB from its own
+text — Chromebooks are excluded outright regardless of spec.
+
+To find these for a new marketplace: open the Warehouse Notebooks search in a browser,
+apply a RAM-capacity filter in Amazon's own UI, and read the href it produces — that
+carries the correct `bbn`, node and facet values together.
 
 ## Notes
 

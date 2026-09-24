@@ -36,18 +36,30 @@ from selenium.webdriver.support.ui import WebDriverWait
 # Amazon silently ignore the category filter and serve the wrong department.
 #
 #   srs / bbn = that marketplace's Warehouse Deals node
-#   rh=n:...  = its "Notebooks" category
+#   rh=n:...  = its "Notebooks" category, plus a p_n_g-... RAM-capacity facet
+#               so Amazon itself pre-filters to ~16GB+ before we ever see a
+#               card — DE additionally stacks a storage-capacity facet.
+# DE deliberately uses i=computers, not i=warehouse-deals like the other four:
+# that's what Amazon's own UI produced for this exact node/facet combination,
+# and srs/bbn (the Warehouse node) still constrain it the same way — verified
+# live, prices and stock behave identically to the other marketplaces.
 SEARCH_PATHS = {
-    "DE": ("/s?i=warehouse-deals&srs=3581963031"
-           "&bbn=3581963031&rh=n%3A427957031&s=price-asc-rank"),
-    "IT": ("/s?i=warehouse-deals&srs=3581999031"
-           "&bbn=3581999031&rh=n%3A460158031&s=price-asc-rank"),
-    "ES": ("/s?i=warehouse-deals&srs=3582001031"
-           "&bbn=3582001031&rh=n%3A938008031&s=price-asc-rank"),
-    "FR": ("/s?i=warehouse-deals&srs=3581943031"
-           "&bbn=3581943031&rh=n%3A429879031&s=price-asc-rank"),
-    "UK": ("/s?i=warehouse-deals&srs=3581866031"
-           "&bbn=3581866031&rh=n%3A429886031&s=price-asc-rank"),
+    "DE": ("/s?i=computers&srs=3581963031&bbn=3581963031"
+           "&rh=n%3A427957031%2Cp_n_g-101014849667111%3A88253294031"
+           "%2Cp_n_g-1003119721111%3A100549564031%257C27399048031"
+           "%257C27399051031%257C27399052031&s=price-asc-rank"),
+    "IT": ("/s?i=warehouse-deals&srs=3581999031&bbn=3581999031"
+           "&rh=n%3A460158031%2Cp_n_g-1003119721111%3A27399062031"
+           "%257C27399065031%257C27399066031&s=price-asc-rank"),
+    "ES": ("/s?i=warehouse-deals&srs=3582001031&bbn=3582001031"
+           "&rh=n%3A938008031%2Cp_n_g-1003119721111%3A100549558031"
+           "%257C27399055031%257C27399058031%257C27399059031&s=price-asc-rank"),
+    "FR": ("/s?i=warehouse-deals&srs=3581943031&bbn=3581943031"
+           "&rh=n%3A429879031%2Cp_n_g-1003119721111%3A27399077031"
+           "%257C27399080031%257C27399081031&s=price-asc-rank"),
+    "UK": ("/s?i=warehouse-deals&srs=3581866031&bbn=3581866031"
+           "&rh=n%3A429886031%2Cp_n_g-1003119721111%3A27399086031"
+           "%257C27399089031%257C27399090031&s=price-asc-rank"),
 }
 
 DOMAINS = {
@@ -140,9 +152,41 @@ PRICE_RE = re.compile(r"^(?:[€£]|(?:EUR|GBP)\xa0)[\d.,]+$")
 # not enough to trust.
 NOTEBOOK_WORDS = (
     "laptop", "notebook", "chromebook", "macbook", "ultrabook", "netbook",
-    "portátil", "portatil", "ordinateur portable", "portable",
+    # Bare "portable" is deliberately absent — it is French for laptop, but
+    # also plain English for "portable [anything]", which is exactly how a
+    # "Portable Gaming Console" (a handheld, not a laptop) slipped past this
+    # gate once already. The fuller phrases below aren't ambiguous that way.
+    "portátil", "portatil", "ordinateur portable", "pc portable",
     "computer portatile", "portatile",
     "surface pro", "surface laptop", "surface go", "surface book",
+    # Premium/business lines whose titles often skip the word "laptop"
+    # entirely and rely on the line name alone. "legion" and "rog" are
+    # deliberately absent — Legion Go / ROG Ally are handheld gaming
+    # consoles, not laptops, and a real Legion/ROG *laptop* listing says
+    # "laptop" anyway, so nothing real is missed by leaving them out.
+    "vivobook", "ideapad", "thinkpad", "zenbook", "aspire", "swift",
+    "spectre", "envy", "pavilion", "inspiron", "latitude", "precision",
+    "xps", "probook", "elitebook", "omnibook", "travelmate", "extensa",
+    "predator", "nitro", "galaxy book",
+)
+
+# Minimum spec bar — anything under either number is filtered out even if it
+# is a genuine laptop, so most Chromebooks and entry Windows laptops would
+# already fail this on their own; "chromebook" is excluded outright below
+# regardless of spec, since some newer ones do clear 16GB/512GB.
+MIN_RAM_GB     = 16
+MIN_STORAGE_GB = 512
+
+_CAP = r"(\d+)\s*(GB|Go|TB|To)"
+# "4GB RAM", "16GB DDR4", "8GB LPDDR5", "16GB Memory", "16GB Unified Memory"
+RAM_PATTERNS = (
+    re.compile(rf"{_CAP}\s*(?:RAM|DDR\d|LPDDR\d|Unified Memory|Memory)", re.I),
+    re.compile(rf"(?:RAM|Memory)\s*[:\-]?\s*{_CAP}", re.I),
+)
+# "128GB SSD", "64GB eMMC", "1TB Storage", "512GB Flash"
+STORAGE_PATTERNS = (
+    re.compile(rf"{_CAP}\s*(?:SSD|eMMC|HDD|Flash|Storage|MMC|Disk)", re.I),
+    re.compile(rf"(?:SSD|eMMC|HDD|Flash|Storage|Disk)\s*[:\-]?\s*{_CAP}", re.I),
 )
 
 # Rejected even when a notebook word is present — a laptop bag or a
@@ -170,12 +214,22 @@ ACCESSORY_WORDS = (
     "stand", "riser", "cooling pad", "lapdesk",
     "docking station", "dock", "usb hub", "hub usb",
     "sticker", "skin decal", "decal",
-    "webcam", "mouse", "ratón", "raton", "topo", "maus",
+    "external webcam", "usb webcam", "mouse", "ratón", "raton", "topo", "maus",
     "keyboard cover", "keyboard skin",
     "cable", "kabel", "câble", "cavo",
-    "ssd", "hard disk", "hdd", "m.2 ssd", "ram module", "memory module", "ram upgrade",
+    "ram module", "memory module", "ram upgrade",
     "stylus", "pen only", "touchscreen pen",
     "learning computer", "kids laptop", "toy laptop",
+)
+
+# Handheld gaming PCs — not laptops, but they carry real RAM/storage specs
+# and warehouse pricing just like one, so they clear every other check.
+# Named explicitly rather than relying only on the absence of a notebook
+# word, since a title wording quirk (e.g. "Portable Gaming Console") can
+# defeat that gate on its own.
+HANDHELD_WORDS = (
+    "legion go", "rog ally", "steam deck", "gaming console", "gaming konsole",
+    "handheld gaming", "portable gaming console",
 )
 
 NL = chr(10)
@@ -198,13 +252,43 @@ def currency_of(price_str: str) -> str:
     return "£" if "£" in price_str else "€"
 
 
+def _cap_gb(patterns: Tuple[re.Pattern, ...], title: str) -> Optional[int]:
+    for pat in patterns:
+        m = pat.search(title)
+        if m:
+            value, unit = int(m.group(1)), m.group(2).lower()
+            return value * 1024 if unit in ("tb", "to") else value
+    return None
+
+
+def ram_gb(title: str) -> Optional[int]:
+    return _cap_gb(RAM_PATTERNS, title)
+
+
+def storage_gb(title: str) -> Optional[int]:
+    return _cap_gb(STORAGE_PATTERNS, title)
+
+
 def is_notebook(title: str) -> bool:
     low = title.lower()
     if not low:
         return False
     if not any(word in low for word in NOTEBOOK_WORDS):
         return False
-    return not any(bad in low for bad in ACCESSORY_WORDS)
+    if any(bad in low for bad in ACCESSORY_WORDS):
+        return False
+    if "chromebook" in low:
+        return False
+    if any(bad in low for bad in HANDHELD_WORDS):
+        return False
+
+    ram = ram_gb(title)
+    if ram is None or ram < MIN_RAM_GB:
+        return False
+    storage = storage_gb(title)
+    if storage is None or storage < MIN_STORAGE_GB:
+        return False
+    return True
 
 
 def good_enough(price_str: str) -> bool:
