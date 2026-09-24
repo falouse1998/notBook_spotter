@@ -876,16 +876,20 @@ def run_cycle(known: KnownMap,
                 old = market.get("price")
 
                 if not entry.get("active", True):
-                    # A relist is only news if it came back meaningfully
-                    # cheaper. Coming back at the same price (or a token
-                    # discount) is just the listing flickering.
-                    if old and price_dropped_enough(old, price):
-                        btag, btitle, bprice, url = best_deal(asin, combined[asin])
-                        blow = entry.get("markets", {}).get(btag, {}).get("lowest")
-                        log(f"  *** RELIST [{btag}] ***  {old} → {bprice}  |  {btitle[:52]}")
-                        send_new(asin, btag, btitle, bprice, url, lowest=blow,
-                                 since=since, relisted=True)
-                        alerted.add(asin)
+                    # A relist always alerts, regardless of price direction —
+                    # it was truly gone (collect_gone() only retires after
+                    # GONE_STRIKES confirmed-absent cycles, so this isn't a
+                    # flicker) and is worth knowing about again either way.
+                    # `lowest` still carries the price history into the
+                    # message so you can judge whether it's actually a good
+                    # deal, without that history gating whether you hear
+                    # about it at all.
+                    btag, btitle, bprice, url = best_deal(asin, combined[asin])
+                    blow = entry.get("markets", {}).get(btag, {}).get("lowest")
+                    log(f"  *** RELIST [{btag}] ***  {old} → {bprice}  |  {btitle[:52]}")
+                    send_new(asin, btag, btitle, bprice, url, lowest=blow,
+                             since=since, relisted=True)
+                    alerted.add(asin)
                     continue
 
                 # Only drops of at least PRICE_DROP_THRESHOLD. A rise, or a
