@@ -876,14 +876,18 @@ def run_cycle(known: KnownMap,
                 old = market.get("price")
 
                 if not entry.get("active", True):
-                    # A relist always alerts, regardless of price direction —
-                    # it was truly gone (collect_gone() only retires after
-                    # GONE_STRIKES confirmed-absent cycles, so this isn't a
-                    # flicker) and is worth knowing about again either way.
-                    # `lowest` still carries the price history into the
-                    # message so you can judge whether it's actually a good
-                    # deal, without that history gating whether you hear
-                    # about it at all.
+                    # A relist alerts regardless of price direction — it was
+                    # truly gone (collect_gone() only retires after
+                    # GONE_STRIKES confirmed-absent cycles) and worth knowing
+                    # about again either way, with `lowest` carrying the price
+                    # history into the message rather than gating it.
+                    #
+                    # But a listing sitting right at the page-1 cutoff can
+                    # flicker gone/back every cycle at an unchanged price as
+                    # other listings shuffle past it — that isn't news, it's
+                    # pagination noise, so an unchanged price stays silent.
+                    if old and parse_price(price) == parse_price(old):
+                        continue
                     btag, btitle, bprice, url = best_deal(asin, combined[asin])
                     blow = entry.get("markets", {}).get(btag, {}).get("lowest")
                     log(f"  *** RELIST [{btag}] ***  {old} → {bprice}  |  {btitle[:52]}")
