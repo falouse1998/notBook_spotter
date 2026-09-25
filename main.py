@@ -11,6 +11,7 @@ without it the search page returns ~1 priced card out of 24, with it ~23.
 
 import json
 import os
+import random
 import re
 import signal
 import sys
@@ -99,11 +100,18 @@ CHROME_PATH       = os.environ.get(
 # built against its own Chromium, so the container sets this and never downloads.
 CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "")
 
-# Drivers are persistent and polled in parallel, so a cycle costs ~2.5s.
+# Drivers are persistent and polled in parallel, so a cycle costs ~2.5-7s.
 # Worst case alert latency is roughly REFRESH_INTERVAL + cycle time.
 # 5s meant near-continuous polling: five browsers overlapped, pages timed out,
-# and every timeout used to wipe the database. 10s keeps it fast but stable.
-REFRESH_INTERVAL  = 10
+# and every timeout used to wipe the database. 10s ran stably for a day, but a
+# fixed 10s cadence across 5 Amazon sites, 24/7, is also an easy bot signature
+# on its own — and on 2026-09-24 it drew a ~4.5h total block across all five
+# domains at once (0 cards, not just 0 priced) that self-lifted on its own.
+# 30s cuts request volume 3x; REFRESH_JITTER breaks the metronome-exact
+# timing so cycles land at 25-35s apart, not identically every 30.000s.
+# Treat this as a starting point to test, not a proven-safe number yet.
+REFRESH_INTERVAL  = 30
+REFRESH_JITTER    = 5
 PAGE_TIMEOUT      = 20
 DE_TOLERANCE      = 0.05   # prefer DE if within 5% of the lowest price
 
@@ -969,6 +977,12 @@ def collect_gone(known: KnownMap, current: AllMap, healthy: Set[str]) -> List[st
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
+def refresh_delay() -> float:
+    """REFRESH_INTERVAL +/- REFRESH_JITTER seconds, so cycles land at an
+    irregular cadence instead of an exact, easily-fingerprinted interval."""
+    return REFRESH_INTERVAL + random.uniform(-REFRESH_JITTER, REFRESH_JITTER)
+
+
 def _sigterm(signum, frame) -> None:
     """`kill <pid>` and systemd's default stop signal are both SIGTERM, which
     Python does not turn into a catchable exception on its own — without this
@@ -991,7 +1005,8 @@ def main() -> None:
     is_first_cycle: bool     = len(known) == 0
     failures:       int      = 0
 
-    log(f"Notebook sniper starting  |  domains={list(DOMAINS)}  |  refresh={REFRESH_INTERVAL}s")
+    log(f"Notebook sniper starting  |  domains={list(DOMAINS)}  |  "
+        f"refresh={REFRESH_INTERVAL}s ±{REFRESH_JITTER}s")
     if is_first_cycle:
         log("No saved data — first cycle sends a digest of everything live now.")
     else:
@@ -1054,7 +1069,7 @@ def main() -> None:
                 if sick:
                     maybe_rebuild(sick)
 
-                time.sleep(max(0.0, REFRESH_INTERVAL - (time.time() - started)))
+                time.sleep(max(0.0, refresh_delay() - (time.time() - started)))
 
             except KeyboardInterrupt:
                 log("Stopped by user.")
@@ -1068,7 +1083,7 @@ def main() -> None:
                     failures = 0
                     time.sleep(LONG_COOLDOWN)
                 else:
-                    time.sleep(REFRESH_INTERVAL)
+                    time.sleep(refresh_delay())
     finally:
         for tag in list(DRIVERS):
             quit_driver(DRIVERS.pop(tag, None))

@@ -78,8 +78,13 @@ except the Telegram vars have working defaults.
 | `CHROMEDRIVER_PATH` | `/usr/bin/chromedriver` in the image, else Selenium Manager | driver binary |
 | `STATE_DIR` | next to `main.py` | where `known_listings.json` and the lock live |
 
-Polling rate is `REFRESH_INTERVAL` in `main.py` (10s). Raising it to 30s cuts CPU roughly
-threefold, at the cost of alert latency.
+Polling rate is `REFRESH_INTERVAL` in `main.py` (30s, ±`REFRESH_JITTER` of 5s so cycles
+don't land at an exact, easily-fingerprinted cadence). It started at 10s, but a fixed 10s
+cadence across 5 Amazon sites, 24/7, drew a ~4.5h total block across all five domains at
+once on 2026-09-24 (0 cards, not just 0 priced — Amazon's own health check, described
+below, didn't catch it because it only detects 0 *priced* out of some cards, not 0 cards
+outright). Treat 30s as a starting point being tested, not a proven-safe number — raising
+it further cuts request volume (and likely block risk) at the cost of alert latency.
 
 `telegram.env` is `chmod 600`, lives only on the host under `/opt/notebook_spotter/`, and
 is `.gitignore`'d — it must never be committed. Both `notebook_spotter.service` (via
@@ -148,9 +153,10 @@ sudo systemctl disable --now notebook_spotter-watchdog.timer   # turn alerting o
 
 ## Alert latency
 
-Cycles start every 10s (`REFRESH_INTERVAL`) and each domain alerts the moment it reports,
-without waiting for the slowest marketplace. A new listing or a price drop therefore
-reaches Telegram about 8-16s after it appears on the page being watched.
+Cycles start roughly every 25-35s (`REFRESH_INTERVAL` ± `REFRESH_JITTER`) and each domain
+alerts the moment it reports, without waiting for the slowest marketplace. A new listing
+or a price drop therefore reaches Telegram about 30-45s after it appears on the page being
+watched, up from ~10-20s before the interval was raised to reduce block risk.
 
 That is the floor, not a guarantee: only page 1 of the price-ascending results is read, so
 anything priced above that page is never seen at all, however fast the polling.
