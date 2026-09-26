@@ -1,6 +1,6 @@
 """Notebook Warehouse-deal sniper.
 
-Watches Amazon Warehouse across DE/IT/ES/FR/UK for laptops and fires a
+Watches Amazon Warehouse across DE/IT/ES for laptops and fires a
 Telegram alert the moment a listing appears or its price moves, so a good deal
 can be bought before someone else takes it.
 
@@ -9,11 +9,12 @@ deliverable address. Every driver sets a local delivery postcode at startup —
 without it the search page returns ~1 priced card out of 24, with it ~23.
 """
 
+import base64
 import json
 import os
-import random
 import re
 import signal
+import socket
 import sys
 import threading
 import time
@@ -55,20 +56,12 @@ SEARCH_PATHS = {
     "ES": ("/s?i=warehouse-deals&srs=3582001031&bbn=3582001031"
            "&rh=n%3A938008031%2Cp_n_g-1003119721111%3A100549558031"
            "%257C27399055031%257C27399058031%257C27399059031&s=price-asc-rank"),
-    "FR": ("/s?i=warehouse-deals&srs=3581943031&bbn=3581943031"
-           "&rh=n%3A429879031%2Cp_n_g-1003119721111%3A27399077031"
-           "%257C27399080031%257C27399081031&s=price-asc-rank"),
-    "UK": ("/s?i=warehouse-deals&srs=3581866031&bbn=3581866031"
-           "&rh=n%3A429886031%2Cp_n_g-1003119721111%3A27399086031"
-           "%257C27399089031%257C27399090031&s=price-asc-rank"),
 }
 
 DOMAINS = {
     "DE": "https://www.amazon.de",
     "IT": "https://www.amazon.it",
     "ES": "https://www.amazon.es",
-    "FR": "https://www.amazon.fr",
-    "UK": "https://www.amazon.co.uk",
 }
 
 # What a card on this marketplace should be priced in. Amazon occasionally
@@ -77,15 +70,13 @@ DOMAINS = {
 # later genuine drop compared a real £ price against a stale € one and
 # produced a nonsense "-14%". A price in the wrong currency for its own
 # marketplace is treated the same as no price at all.
-EXPECTED_CURRENCY = {"DE": "€", "IT": "€", "ES": "€", "FR": "€", "UK": "£"}
+EXPECTED_CURRENCY = {"DE": "€", "IT": "€", "ES": "€"}
 
 # A deliverable address per marketplace. This is what unlocks the prices.
 ZIPS = {
     "DE": "10115",      # Berlin
     "IT": "00100",      # Roma
     "ES": "28001",      # Madrid
-    "FR": "75001",      # Paris
-    "UK": "SW1A1AA",    # London
 }
 
 # Windows dev box and the Linux server disagree on where Chrome lives, and the
@@ -100,23 +91,43 @@ CHROME_PATH       = os.environ.get(
 # built against its own Chromium, so the container sets this and never downloads.
 CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "")
 
-# Drivers are persistent and polled in parallel, so a cycle costs ~2.5-7s.
-# Worst case alert latency is roughly REFRESH_INTERVAL + cycle time.
+# One-off experiment: route the listed domains' Chrome traffic through a mobile
+# proxy instead of the VPS's own IP, to see whether that holds up against
+# Amazon's blocking better than backing off request volume alone. Comma-
+# separated tags, e.g. "DE" — empty (the default) means every domain uses the
+# VPS's direct connection, unchanged. Credentials live only in the environment,
+# same as the Telegram token, never hardcoded here.
+PROXY_DOMAINS = {t.strip() for t in os.environ.get("PROXY_DOMAINS", "").split(",") if t.strip()}
+PROXY_HOST    = os.environ.get("PROXY_HOST", "")
+PROXY_PORT    = os.environ.get("PROXY_PORT", "")
+PROXY_USER    = os.environ.get("PROXY_USER", "")
+PROXY_PASS    = os.environ.get("PROXY_PASS", "")
+
 # 5s meant near-continuous polling: five browsers overlapped, pages timed out,
 # and every timeout used to wipe the database. 10s ran stably for a day, but a
 # fixed 10s cadence across 5 Amazon sites, 24/7, is also an easy bot signature
 # on its own — and on 2026-09-24 it drew a ~4.5h total block across all five
 # domains at once (0 cards, not just 0 priced) that self-lifted on its own.
-# 30s cuts request volume 3x; REFRESH_JITTER breaks the metronome-exact
-# timing so cycles land at 25-35s apart, not identically every 30.000s.
-# Treat this as a starting point to test, not a proven-safe number yet.
-REFRESH_INTERVAL  = 30
-REFRESH_JITTER    = 5
+# Dropping FR/UK helped (3 sites instead of 5), but all 3 now share a single
+# mobile-proxy IP (PROXY_DOMAINS below) instead of the VPS's own — fetching
+# them in parallel would put 3x the request rate through that one IP at once,
+# exactly what a proxy is supposed to avoid. Domains take turns instead: one
+# fetch, then a fixed pause, then the next domain in rotation, so the shared
+# IP only ever has one request in flight. This is the experiment itself —
+# watching how long a single mobile IP holds up at this rate is the point.
+ROTATION_INTERVAL = 60
 PAGE_TIMEOUT      = 20
 DE_TOLERANCE      = 0.05   # prefer DE if within 5% of the lowest price
 
 # Consecutive confirmed absences before a listing is dropped.
 GONE_STRIKES      = 2
+
+# Consecutive cycles with literally 0 product cards (not 0 priced — 0 present at
+# all) before a domain is treated as blocked rather than a one-off slow page load.
+# One Telegram alert fires per block, not one per cycle it stays down, and the
+# flag resets the moment the domain reports cards again so a later block still
+# alerts.
+BLOCK_STRIKES     = 2
 
 # A domain that fails rests, doubling per strike, and is rebuilt in the
 # background so one sick marketplace never stalls the healthy ones.
@@ -456,7 +467,134 @@ def log(msg: str) -> None:
 DRIVERS: Dict[str, webdriver.Chrome] = {}
 
 
-def build_driver() -> webdriver.Chrome:
+def _relay_pipe(a: socket.socket, b: socket.socket) -> None:
+    """Shuttle bytes both ways between two already-connected sockets until
+    both directions have hit EOF."""
+    def forward(src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while True:
+                data = src.recv(8192)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    t1 = threading.Thread(target=forward, args=(a, b), daemon=True)
+    t2 = threading.Thread(target=forward, args=(b, a), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+
+def start_local_proxy(upstream_host: str, upstream_port: int,
+                       user: str, password: str) -> int:
+    """A tiny local, unauthenticated HTTP proxy that forwards everything to an
+    authenticated upstream proxy, injecting its Proxy-Authorization header on
+    the way through. Chrome's own --proxy-server flag has no way to carry a
+    username/password, and the Manifest-V3 extension trick for that turned out
+    to fail silently on current Chrome — this sidesteps both.
+
+    Returns the local port; the caller points Chrome's --proxy-server at
+    127.0.0.1:<that port> and never needs to know real credentials exist.
+    """
+    auth_header = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+    def handle_client(client_sock: socket.socket) -> None:
+        upstream: Optional[socket.socket] = None
+        try:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = client_sock.recv(4096)
+                if not chunk:
+                    return
+                request += chunk
+            head, _, rest = request.partition(b"\r\n\r\n")
+            lines = head.split(b"\r\n")
+            method, target, version = lines[0].decode().split(" ")
+
+            upstream = socket.create_connection((upstream_host, upstream_port), timeout=15)
+
+            if method.upper() == "CONNECT":
+                upstream.sendall(
+                    f"CONNECT {target} {version}\r\n"
+                    f"Proxy-Authorization: {auth_header}\r\n"
+                    f"Host: {target}\r\n\r\n".encode())
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = upstream.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                client_sock.sendall(resp)
+                if b" 200 " not in resp.split(b"\r\n", 1)[0]:
+                    return
+            else:
+                header_lines = [l for l in lines[1:]
+                                 if not l.lower().startswith(b"proxy-authorization")]
+                header_lines.append(f"Proxy-Authorization: {auth_header}".encode())
+                upstream.sendall(lines[0] + b"\r\n" +
+                                  b"\r\n".join(header_lines) + b"\r\n\r\n" + rest)
+
+            _relay_pipe(client_sock, upstream)
+        except OSError:
+            pass
+        finally:
+            client_sock.close()
+            if upstream:
+                upstream.close()
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(50)
+    local_port = server.getsockname()[1]
+
+    def accept_loop() -> None:
+        while True:
+            client, _ = server.accept()
+            threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+    return local_port
+
+
+_local_proxy_port: Optional[int] = None
+_local_proxy_lock = threading.Lock()
+
+
+def ensure_local_proxy() -> int:
+    """Starts the local relay at most once and hands back its port every time
+    after — every proxied domain shares the one relay, since it is generic."""
+    global _local_proxy_port
+    with _local_proxy_lock:
+        if _local_proxy_port is None:
+            _local_proxy_port = start_local_proxy(
+                PROXY_HOST, int(PROXY_PORT), PROXY_USER, PROXY_PASS)
+            log(f"  local proxy relay on 127.0.0.1:{_local_proxy_port} "
+                f"-> {PROXY_HOST}:{PROXY_PORT}")
+        return _local_proxy_port
+
+
+def _log_egress_ip(driver: webdriver.Chrome, tag: str) -> None:
+    """Only called while a proxy test is active — confirms which IP a domain's
+    traffic is actually leaving from, since a misconfigured proxy extension
+    fails silently back to the direct connection rather than erroring."""
+    try:
+        driver.get("https://api.ipify.org")
+        ip = driver.find_element(By.TAG_NAME, "body").text.strip()
+        log(f"  [{tag}] egress IP: {ip}")
+    except Exception as exc:
+        log(f"  [{tag}] egress IP check failed: {type(exc).__name__}")
+
+
+def build_driver(tag: str) -> webdriver.Chrome:
     opts = Options()
     opts.binary_location = CHROME_PATH
     opts.page_load_strategy = "eager"        # DOM is enough; subresources are noise
@@ -470,6 +608,11 @@ def build_driver() -> webdriver.Chrome:
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_experimental_option(
         "prefs", {"profile.managed_default_content_settings.images": 2})
+
+    if tag in PROXY_DOMAINS and PROXY_HOST and PROXY_PORT:
+        local_port = ensure_local_proxy()
+        opts.add_argument(f"--proxy-server=127.0.0.1:{local_port}")
+        log(f"  [{tag}] routing through proxy {PROXY_HOST}:{PROXY_PORT}")
 
     service = Service(executable_path=CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else None
     driver = webdriver.Chrome(options=opts, service=service) if service \
@@ -534,7 +677,9 @@ def build_and_bootstrap(tag: str) -> Tuple[webdriver.Chrome, bool]:
     Without an address Amazon serves priceless pages, which look exactly like
     "no stock" — so a failure here must not be reported as a healthy domain.
     """
-    driver = build_driver()
+    driver = build_driver(tag)
+    if PROXY_DOMAINS:
+        _log_egress_ip(driver, tag)
     return driver, set_location(driver, tag)
 
 
@@ -642,6 +787,17 @@ def fetch_domain(tag: str) -> DomainMap:
     # retired every listing and made them all relist minutes later.
     if cards and not priced:
         raise Challenged(f"{cards} cards, 0 prices — delivery address lost")
+
+    if cards:
+        block_strikes.pop(tag, None)
+        blocked_alerted.discard(tag)
+    else:
+        block_strikes[tag] = block_strikes.get(tag, 0) + 1
+        if block_strikes[tag] >= BLOCK_STRIKES and tag not in blocked_alerted:
+            blocked_alerted.add(tag)
+            _post(f"🚫 [{tag}] looks blocked — 0 product cards for "
+                  f"{block_strikes[tag]} cycles running. Staying quiet on "
+                  f"this domain until it recovers.")
 
     log(f"  [{tag}] {len(results)} notebook(s)  ({priced}/{cards} cards priced)")
     return results
@@ -778,6 +934,9 @@ strikes:        Dict[str, int]             = {}
 _rebuild:       Optional[threading.Thread] = None
 _last_rebuild:  Dict[str, float]           = {}
 
+block_strikes:   Dict[str, int] = {}   # consecutive 0-card cycles, per domain
+blocked_alerted: Set[str]       = set()  # domains already notified for the current block
+
 
 def active_domains() -> List[str]:
     now = time.time()
@@ -831,13 +990,15 @@ def maybe_rebuild(tags: List[str]) -> None:
 
 # ── CYCLE ─────────────────────────────────────────────────────────────────────
 
-def run_cycle(known: KnownMap,
-              first_cycle: bool) -> Tuple[AllMap, List[str], Set[str]]:
+def run_cycle(known: KnownMap, first_cycle: bool,
+              tags: List[str]) -> Tuple[AllMap, List[str], Set[str]]:
+    """Fetches exactly the given domains — the caller decides which (and how
+    many) run this turn, so a single-domain rotation and an all-at-once cycle
+    both go through the same machinery."""
     combined: AllMap    = {}
     sick:     List[str] = []
     alerted:  Set[str]  = set()
     healthy:  Set[str]  = set()     # domains that actually answered this cycle
-    tags = active_domains()
     if not tags:
         return combined, sick, healthy
 
@@ -977,12 +1138,6 @@ def collect_gone(known: KnownMap, current: AllMap, healthy: Set[str]) -> List[st
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
-def refresh_delay() -> float:
-    """REFRESH_INTERVAL +/- REFRESH_JITTER seconds, so cycles land at an
-    irregular cadence instead of an exact, easily-fingerprinted interval."""
-    return REFRESH_INTERVAL + random.uniform(-REFRESH_JITTER, REFRESH_JITTER)
-
-
 def _sigterm(signum, frame) -> None:
     """`kill <pid>` and systemd's default stop signal are both SIGTERM, which
     Python does not turn into a catchable exception on its own — without this
@@ -1006,7 +1161,7 @@ def main() -> None:
     failures:       int      = 0
 
     log(f"Notebook sniper starting  |  domains={list(DOMAINS)}  |  "
-        f"refresh={REFRESH_INTERVAL}s ±{REFRESH_JITTER}s")
+        f"rotation: 1 domain every {ROTATION_INTERVAL}s")
     if is_first_cycle:
         log("No saved data — first cycle sends a digest of everything live now.")
     else:
@@ -1031,24 +1186,34 @@ def main() -> None:
             return
         log(f"Ready  |  {len(DRIVERS)}/{len(DOMAINS)} domains live")
 
+        domain_order = list(DOMAINS)   # fixed rotation order
+        turn = 0
+
         while True:
             try:
                 started = time.time()
-                log("--- Fetching ---")
-                current, sick, healthy = run_cycle(known, is_first_cycle)
+                tag  = domain_order[turn % len(domain_order)]
+                turn += 1
+                tags = [tag] if tag in active_domains() else []
+
+                log(f"--- Fetching [{tag}] ---" if tags else
+                    f"--- Skipping [{tag}] (cooling down) ---")
+                current, sick, healthy = run_cycle(known, is_first_cycle, tags)
 
                 gone = collect_gone(known, current, healthy)
 
                 if is_first_cycle:
-                    log(f"Fresh start — digesting {len(current)} notebook listing(s).")
-                    blocks = []
-                    deals  = [best_deal(a, current[a]) for a in current]
-                    for tag, title, price, url in sorted(
-                            deals, key=lambda d: parse_price(d[2])):
-                        log(f"  [{tag}] {price}  |  {title[:60]}")
-                        asin = url.rsplit("/", 1)[-1]
-                        blocks.append(build_message("•", asin, tag, title, price, url))
-                    send_digest(blocks)
+                    if current:
+                        log(f"Fresh start — digesting {len(current)} "
+                            f"notebook listing(s) from [{tag}].")
+                        blocks = []
+                        deals  = [best_deal(a, current[a]) for a in current]
+                        for btag, title, price, url in sorted(
+                                deals, key=lambda d: parse_price(d[2])):
+                            log(f"  [{btag}] {price}  |  {title[:60]}")
+                            asin = url.rsplit("/", 1)[-1]
+                            blocks.append(build_message("•", asin, btag, title, price, url))
+                        send_digest(blocks)
                     is_first_cycle = False
                 else:
                     for asin in gone:
@@ -1069,7 +1234,7 @@ def main() -> None:
                 if sick:
                     maybe_rebuild(sick)
 
-                time.sleep(max(0.0, refresh_delay() - (time.time() - started)))
+                time.sleep(max(0.0, ROTATION_INTERVAL - (time.time() - started)))
 
             except KeyboardInterrupt:
                 log("Stopped by user.")
@@ -1083,7 +1248,7 @@ def main() -> None:
                     failures = 0
                     time.sleep(LONG_COOLDOWN)
                 else:
-                    time.sleep(refresh_delay())
+                    time.sleep(ROTATION_INTERVAL)
     finally:
         for tag in list(DRIVERS):
             quit_driver(DRIVERS.pop(tag, None))
